@@ -4,14 +4,11 @@ This is an MVP that captures **system audio output** (Windows WASAPI loopback) a
 
 ## Setup
 
-From `c:\Users\zacha\Projects`:
-
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
-
 ## Run
 
 ```bash
