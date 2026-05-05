@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+
+# Local debug logs
+debug-*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.cursor/
+

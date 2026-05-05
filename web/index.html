@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>System Audio Spectrum Plane</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #05060a;
+        color: #c7d1ff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          "Courier New", monospace;
+      }
+      #hud {
+        position: absolute;
+        left: 10px;
+        top: 10px;
+        padding: 10px 12px;
+        background: rgba(10, 12, 20, 0.65);
+        border: 1px solid rgba(120, 150, 255, 0.25);
+        border-radius: 10px;
+        backdrop-filter: blur(8px);
+        line-height: 1.35;
+        user-select: none;
+      }
+      #hud strong {
+        color: #ffffff;
+      }
+      #hint {
+        opacity: 0.85;
+        margin-top: 6px;
+        font-size: 12px;
+      }
+      canvas {
+        display: block;
+      }
+      /* World-anchored labels: position set each frame from Vector3.project(camera) */
+      #axis-legends {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 5;
+      }
+      .viz-3d-label {
+        position: fixed;
+        left: 0;
+        top: 0;
+        visibility: hidden;
+        color: rgba(210, 220, 255, 0.95);
+        font-size: 11px;
+        line-height: 1.2;
+        text-shadow: 0 0 8px rgba(0, 0, 0, 0.9);
+        white-space: nowrap;
+        will-change: left, top;
+      }
+      .viz-3d-label.viz-3d-title {
+        font-weight: 600;
+        color: #fff;
+        font-size: 12px;
+      }
+      .viz-3d-label .viz-3d-sub {
+        display: block;
+        font-weight: 400;
+        font-size: 10px;
+        opacity: 0.85;
+        margin-top: 2px;
+      }
+      .viz-3d-label[data-align="center"] {
+        transform: translate(-50%, -50%);
+      }
+      .viz-3d-label[data-align="above"] {
+        transform: translate(-50%, calc(-100% - 6px));
+      }
+      .viz-3d-label[data-align="left"] {
+        transform: translate(calc(-100% - 8px), -50%);
+      }
+    </style>
+    <!-- Local Three.js (served from /vendor/ by music_viz_server.py); no CDN required -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three.module.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">
+      <div><strong>System Audio Spectrum Plane</strong></div>
+      <div id="status">connecting…</div>
+      <div id="hint">Drag to orbit · Scroll to zoom</div>
+    </div>
+
+    <div id="axis-legends" data-axis-legend="1" aria-hidden="true"></div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "/vendor/OrbitControls.js";
+
+      const statusEl = document.getElementById("status");
+
+      function main() {
+        // #region agent log
+        fetch("http://127.0.0.1:7764/ingest/e4740462-32b8-4549-b086-754682f74b57", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "f98fec" },
+          body: JSON.stringify({
+            sessionId: "f98fec",
+            hypothesisId: "H3",
+            location: "web/index.html:main",
+            message: "client_main_started",
+            data: { host: location.host, protocol: location.protocol },
+            timestamp: Date.now(),
+          }),
+        }).catch(() => {});
+        // #endregion
+        statusEl.textContent = "loaded (initializing 3D + websocket)…";
+        // Scene
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.Fog(0x05060a, 90, 220);
+
+        const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.1, 600);
+        camera.position.set(0, 42, 135);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.06;
+        controls.target.set(0, 6, 0);
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+        const dir = new THREE.DirectionalLight(0xaac6ff, 0.9);
+        dir.position.set(40, 80, 20);
+        scene.add(dir);
+
+        // Grid
+        const grid = new THREE.GridHelper(220, 44, 0x2840aa, 0x16214f);
+        grid.position.y = -8;
+        scene.add(grid);
+
+        // Indexed plane mesh: X = frequency, Z = depth (thin), Y = amplitude height
+        let nPoints = 0;
+        let positions = null;
+        let colors = null;
+        let geometry = null;
+        let mesh = null;
+        let legendRefLines = null;
+        let legendAnchors = [];
+        const _legendProj = new THREE.Vector3();
+        const _legendView = new THREE.Vector3();
+        const _legendFrustum = new THREE.Frustum();
+        const _legendFrustumMat = new THREE.Matrix4();
+
+        // Motion smoothing (client-side):
+        // - `aLatest` is only updated from websocket frames.
+        // - `aDisplay` is lerped toward spatially blurred `aLatest` every render frame (fluid motion).
+        // Asymmetric temporal smoothing: quick rise (responsive), slower fall (fluid decay).
+        const MOTION_ATTACK_HZ = 14;
+        const MOTION_RELEASE_HZ = 4.5;
+        const SPATIAL_BLUR = 0.2; // 0..0.5 per pass; neighbor averaging
+        const SPATIAL_PASSES = 2; // 1 or 2 (second pass extra-softens spikes)
+        let aLatest = null; // raw spectrum from server
+        let aBlurred = null; // scratch + pass-1 output
+        let aBlur2 = null; // pass-2 output (when SPATIAL_PASSES>=2)
+        let aDisplay = null; // smoothed values driving the mesh
+        let _lastAnimT = performance.now();
+
+        // X = frequency "length", Z = sheet "width" (depth). Tuned: −30% length, +50% width vs prior 240×10.
+        const PLANE_W = 168;
+        const PLANE_D = 15;
+        const PLANE_NZ = 3;
+        const FLOOR_Y = -8;
+        const HEIGHT = 28;
+        /** Depth slice used for axis anchors (center of ribbon in Z). */
+        const AXIS_Z = 0;
+
+        function hsvToRgb(h, s, v) {
+          const i = Math.floor(h * 6) % 6;
+          const f = h * 6 - Math.floor(h * 6);
+          const p = v * (1 - s);
+          const q = v * (1 - f * s);
+          const t = v * (1 - (1 - f) * s);
+          switch (i) {
+            case 0:
+              return [v, t, p];
+            case 1:
+              return [q, v, p];
+            case 2:
+              return [p, v, t];
+            case 3:
+              return [p, q, v];
+            case 4:
+              return [t, p, v];
+            default:
+              return [v, p, q];
+          }
+        }
+
+        /** t in [0,1]: low freq -> red, high -> purple (matches music_viz_3d HSV sweep) */
+        function freqRgb(t) {
+          const tt = Math.max(0, Math.min(1, t));
+          const h = tt * (280 / 360);
+          return hsvToRgb(h, 0.92, 1.0);
+        }
+
+        function formatHz(f) {
+          if (f < 1000) return f >= 100 ? `${f.toFixed(0)} Hz` : `${f} Hz`;
+          const k = f / 1000;
+          if (k < 10) {
+            const s = k.toFixed(2).replace(/\.?0+$/, "");
+            return `${s} kHz`;
+          }
+          return `${k.toFixed(1)} kHz`;
+        }
+
+        function updateLegendScreenPositions() {
+          if (!legendAnchors.length) return;
+          const reversed = !!camera.reversedDepth;
+          _legendFrustumMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+          _legendFrustum.setFromProjectionMatrix(_legendFrustumMat, THREE.WebGLCoordinateSystem, reversed);
+          const r = renderer.domElement.getBoundingClientRect();
+          for (let i = 0; i < legendAnchors.length; i++) {
+            const { el, world } = legendAnchors[i];
+            if (!_legendFrustum.containsPoint(world)) {
+              el.style.visibility = "hidden";
+              continue;
+            }
+            _legendView.copy(world).applyMatrix4(camera.matrixWorldInverse);
+            if (_legendView.z >= -1e-4) {
+              el.style.visibility = "hidden";
+              continue;
+            }
+            _legendProj.copy(world).project(camera);
+            if (Math.abs(_legendProj.x) > 1.12 || Math.abs(_legendProj.y) > 1.12) {
+              el.style.visibility = "hidden";
+              continue;
+            }
+            el.style.visibility = "visible";
+            const px = r.left + (_legendProj.x * 0.5 + 0.5) * r.width;
+            const py = r.top + (-_legendProj.y * 0.5 + 0.5) * r.height;
+            el.style.left = `${px}px`;
+            el.style.top = `${py}px`;
+          }
+        }
+
+        /**
+         * Frequency ticks along mesh X at the floor; amplitude ticks along the low-X edge at world Y.
+         * Labels are reprojected every frame so they stay glued to the waveform under OrbitControls.
+         */
+        function buildAxisLegends(fMin, fMax) {
+          const root = document.getElementById("axis-legends");
+          if (!root) return { freq: 0, amp: 0 };
+
+          if (legendRefLines) {
+            scene.remove(legendRefLines.freq);
+            scene.remove(legendRefLines.amp);
+            legendRefLines.freq.geometry.dispose();
+            legendRefLines.amp.geometry.dispose();
+            legendRefLines.mat.dispose();
+            legendRefLines = null;
+          }
+
+          root.innerHTML = "";
+          legendAnchors = [];
+
+          const pushLabel = (html, wx, wy, wz, className, dataAlign) => {
+            const el = document.createElement("div");
+            el.className = `viz-3d-label ${className}`.trim();
+            el.innerHTML = html;
+            if (dataAlign) el.dataset.align = dataAlign;
+            root.appendChild(el);
+            legendAnchors.push({ el, world: new THREE.Vector3(wx, wy, wz) });
+          };
+
+          pushLabel("Frequency (Hz) · low ← → high", 0, FLOOR_Y + 6, AXIS_Z, "viz-3d-title", "above");
+
+          const lf0 = Math.log(fMin);
+          const lf1 = Math.log(fMax);
+          const cand = [40, 100, 250, 630, 1600, 4000, 10000, 16000];
+          let nFreq = 0;
+          for (const f of cand) {
+            if (f < fMin * 0.99 || f > fMax * 1.01) continue;
+            const t = (Math.log(Math.max(f, fMin * 1.0001)) - lf0) / (lf1 - lf0);
+            const x = -PLANE_W * 0.5 + t * PLANE_W;
+            pushLabel(formatHz(f), x, FLOOR_Y + 1.25, AXIS_Z, "", "center");
+            nFreq++;
+          }
+
+          pushLabel(
+            `Amplitude<span class="viz-3d-sub">normalized 0–1 (mesh Y)</span>`,
+            -PLANE_W * 0.5 - 4,
+            FLOOR_Y + HEIGHT * 0.58,
+            AXIS_Z,
+            "viz-3d-title",
+            "left"
+          );
+
+          const amps = [0, 0.25, 0.5, 0.75, 1.0];
+          const xAmp = -PLANE_W * 0.5 - 1.25;
+          for (const a of amps) {
+            pushLabel(a.toFixed(2), xAmp, FLOOR_Y + HEIGHT * a, AXIS_Z, "", "left");
+          }
+
+          const lineMat = new THREE.LineBasicMaterial({
+            color: 0x6a8cff,
+            transparent: true,
+            opacity: 0.42,
+          });
+          const geoFreq = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + 0.06, AXIS_Z),
+            new THREE.Vector3(PLANE_W * 0.5, FLOOR_Y + 0.06, AXIS_Z),
+          ]);
+          const geoAmp = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y, AXIS_Z),
+            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + HEIGHT, AXIS_Z),
+          ]);
+          const lineFreq = new THREE.Line(geoFreq, lineMat);
+          const lineAmp = new THREE.Line(geoAmp, lineMat);
+          scene.add(lineFreq, lineAmp);
+          legendRefLines = { freq: lineFreq, amp: lineAmp, mat: lineMat };
+
+          return { freq: nFreq, amp: amps.length };
+        }
+
+        function allocPlaneMesh(n) {
+          if (mesh) {
+            scene.remove(mesh);
+            geometry?.dispose();
+            mesh.material?.dispose();
+            mesh = null;
+            geometry = null;
+          }
+          nPoints = n;
+          aLatest = new Float32Array(nPoints);
+          aBlurred = new Float32Array(nPoints);
+          aBlur2 = new Float32Array(nPoints);
+          aDisplay = new Float32Array(nPoints);
+          const nx = n;
+          const nz = PLANE_NZ;
+          const nVert = nx * nz;
+          positions = new Float32Array(nVert * 3);
+          colors = new Float32Array(nVert * 3);
+          const ix = [];
+          const denom = Math.max(1, nx - 1);
+          const denomZ = Math.max(1, nz - 1);
+
+          for (let j = 0; j < nz; j++) {
+            for (let i = 0; i < nx; i++) {
+              const vi = j * nx + i;
+              const t = i / denom;
+              const [r, g, b] = freqRgb(t);
+              colors[vi * 3 + 0] = r;
+              colors[vi * 3 + 1] = g;
+              colors[vi * 3 + 2] = b;
+              const x = (i / denom) * PLANE_W - PLANE_W * 0.5;
+              const z = (j / denomZ) * PLANE_D - PLANE_D * 0.5;
+              positions[vi * 3 + 0] = x;
+              positions[vi * 3 + 1] = FLOOR_Y;
+              positions[vi * 3 + 2] = z;
+            }
+          }
+          for (let j = 0; j < nz - 1; j++) {
+            for (let i = 0; i < nx - 1; i++) {
+              const a0 = j * nx + i;
+              const b0 = j * nx + i + 1;
+              const c0 = (j + 1) * nx + i;
+              const d0 = (j + 1) * nx + i + 1;
+              ix.push(a0, c0, b0, b0, c0, d0);
+            }
+          }
+
+          geometry = new THREE.BufferGeometry();
+          geometry.setIndex(ix);
+          geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+          geometry.computeVertexNormals();
+
+          const material = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            metalness: 0.06,
+            roughness: 0.62,
+            side: THREE.DoubleSide,
+          });
+          mesh = new THREE.Mesh(geometry, material);
+          scene.add(mesh);
+        }
+
+        function updateFrame(a) {
+          if (!aLatest || a.length !== nPoints) return;
+          for (let i = 0; i < nPoints; i++) aLatest[i] = Math.max(0, Math.min(1, a[i]));
+        }
+
+        function _applySpatialBlur(src, dst) {
+          // 1D blur: dst = (1-b)*src + b*avg(neighbors)
+          const b = SPATIAL_BLUR;
+          if (b <= 0) {
+            dst.set(src);
+            return;
+          }
+          const inv = 1 - b;
+          const n = src.length;
+          dst[0] = inv * src[0] + b * (0.5 * (src[0] + src[1]));
+          for (let i = 1; i < n - 1; i++) {
+            dst[i] = inv * src[i] + b * (0.5 * (src[i - 1] + src[i + 1]));
+          }
+          dst[n - 1] = inv * src[n - 1] + b * (0.5 * (src[n - 2] + src[n - 1]));
+        }
+
+        // WebSocket (must use http:// from music_viz_server — not file://)
+        if (!location.host) {
+          statusEl.textContent =
+            "Open this page from the app link (http://127.0.0.1:8765/), not as a saved file.";
+          return;
+        }
+        const wsProto = location.protocol === "https:" ? "wss" : "ws";
+        const primaryWsUrl = `${wsProto}://${location.host}/ws`;
+        const altWsUrl = `${wsProto}://localhost:${location.port}/ws`;
+        const hangTimer = window.setTimeout(() => {
+          statusEl.textContent =
+            "Still connecting… If you have a proxy/VPN/extension that blocks localhost WebSockets, try a different browser or disable the proxy for localhost.";
+        }, 8000);
+
+        function connectWs(url, label) {
+          statusEl.textContent = `connecting (${label})…`;
+          const ws = new WebSocket(url);
+          ws.onopen = () => {
+            window.clearTimeout(hangTimer);
+            statusEl.textContent = `connected (${label}) (waiting for audio)…`;
+          };
+          ws.onclose = () => {
+            statusEl.textContent = `disconnected (${label})`;
+          };
+          ws.onerror = () => {
+            // try fallback once
+            if (label === "127.0.0.1" && altWsUrl !== url) {
+              ws.close();
+              connectWs(altWsUrl, "localhost");
+              return;
+            }
+            window.clearTimeout(hangTimer);
+            statusEl.textContent =
+              `websocket error (${label}) — something is blocking ws:// to localhost. Try disabling proxy/VPN or use another browser.`;
+          };
+          return ws;
+        }
+
+        const ws = connectWs(primaryWsUrl, "127.0.0.1");
+        let hudBase = "";
+        ws.onmessage = (ev) => {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch (e) {
+            console.warn("non-json ws message", ev.data);
+            return;
+          }
+          if (msg.type === "hello") {
+            allocPlaneMesh(msg.n_points);
+            const legendCounts = buildAxisLegends(msg.f_min, msg.f_max);
+            // #region agent log
+            fetch("http://127.0.0.1:7764/ingest/e4740462-32b8-4549-b086-754682f74b57", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "f98fec" },
+              body: JSON.stringify({
+                sessionId: "f98fec",
+                hypothesisId: "H1",
+                location: "web/index.html:ws_onmessage",
+                message: "hello_axis_legends_ready",
+                runId: "post-fix",
+                data: {
+                  n_points: msg.n_points,
+                  f_min: msg.f_min,
+                  f_max: msg.f_max,
+                  freq_tick_count: legendCounts.freq,
+                  amp_tick_count: legendCounts.amp,
+                  axis_legends_root_present: !!document.getElementById("axis-legends"),
+                },
+                timestamp: Date.now(),
+              }),
+            }).catch(() => {});
+            // #endregion
+            const dev = msg.device ? `\n${msg.device}` : "";
+            hudBase = `streaming · points=${msg.n_points} · sr=${msg.sample_rate}${dev}`;
+            statusEl.textContent = hudBase;
+          } else if (msg.type === "frame") {
+            updateFrame(msg.a);
+            if (typeof msg.peak === "number") {
+              statusEl.textContent = `${hudBase}\npeak≈${msg.peak.toFixed(5)} (time-domain)`;
+            }
+          }
+        };
+
+        // Render loop
+        function animate() {
+          requestAnimationFrame(animate);
+          const nowT = performance.now();
+          const dtSec = Math.min(0.05, Math.max(0, (nowT - _lastAnimT) / 1000));
+          _lastAnimT = nowT;
+          controls.update();
+          updateLegendScreenPositions();
+          // Smoothly move geometry toward the latest spectrum.
+          if (positions && geometry && aLatest && aBlurred && aDisplay && nPoints > 0) {
+            _applySpatialBlur(aLatest, aBlurred);
+            let tgt = aBlurred;
+            if (SPATIAL_PASSES >= 2) {
+              _applySpatialBlur(aBlurred, aBlur2);
+              tgt = aBlur2;
+            }
+            for (let i = 0; i < nPoints; i++) {
+              const err = tgt[i] - aDisplay[i];
+              const rate = err > 0 ? MOTION_ATTACK_HZ : MOTION_RELEASE_HZ;
+              const alpha = 1 - Math.exp(-rate * dtSec);
+              aDisplay[i] += err * alpha;
+            }
+
+            const nx = nPoints;
+            const nz = PLANE_NZ;
+            for (let j = 0; j < nz; j++) {
+              for (let i = 0; i < nx; i++) {
+                const vi = j * nx + i;
+                positions[vi * 3 + 1] = FLOOR_Y + HEIGHT * aDisplay[i];
+              }
+            }
+            geometry.attributes.position.needsUpdate = true;
+            // Normals are visually nice but expensive; keep them, but only recompute occasionally.
+            if ((nowT | 0) % 3 === 0) geometry.computeVertexNormals();
+          }
+          renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener("resize", () => {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
+
