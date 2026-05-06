@@ -26,14 +26,25 @@ import pyqtgraph.opengl as gl
 class VizConfig:
     # Audio
     sample_rate: int = 48_000
-    block_size: int = 2048  # FFT window size
+    block_size: int = 4096  # FFT window size (higher = better bass resolution, more latency)
     hop_size: int = 512  # how many samples per update
 
     # FFT / spectrum
     f_min: float = 30.0
     f_max: float = 18_000.0
-    n_points: int = 384  # how many frequency samples to render
+    n_points: int = 512  # how many frequency samples to render
     smoothing: float = 0.84  # 0..1, higher = smoother (more lag)
+    db_floor: float = -85.0
+    db_ceil: float = -25.0
+    autorange: bool = True
+    autorange_low_pct: float = 15.0
+    autorange_high_pct: float = 98.0
+    autorange_attack: float = 0.12
+    autorange_release: float = 0.02
+    autorange_headroom_db: float = 6.0
+    autorange_min_span_db: float = 35.0
+    tilt_db_per_decade: float = 6.0
+    tilt_ref_hz: float = 200.0
 
     # 2D plane surface (frequency × depth); amplitude drives mesh height (Z in GL coords)
     plane_width: float = 220.0  # X extent (frequency span)
@@ -183,6 +194,8 @@ class SpectrumPlaneViz(QtWidgets.QMainWindow):
         self.freqs = np.fft.rfftfreq(cfg.block_size, 1.0 / cfg.sample_rate).astype(np.float32)
         self.target_freqs = _log_space_freqs(cfg.f_min, cfg.f_max, cfg.n_points).astype(np.float32)
         self.prev = np.zeros(cfg.n_points, dtype=np.float32)
+        self._db_lo: float | None = None
+        self._db_hi: float | None = None
 
         # UI: GL view with frequency–depth surface (amplitude -> Z height)
         central = QtWidgets.QWidget()
@@ -352,14 +365,37 @@ class SpectrumPlaneViz(QtWidgets.QMainWindow):
         spec = np.fft.rfft(x)
         mag = np.abs(spec).astype(np.float32)
 
-        # Convert to a more usable scale: log magnitude, then normalize
-        mag = np.log10(1e-6 + mag)
-        mag -= mag.min()
-        denom = mag.max() if mag.max() > 1e-9 else 1.0
-        mag /= denom
+        # Convert to dB scale with fixed mapping (stable; avoids bass bias from per-frame normalization)
+        db = (20.0 * np.log10(np.maximum(mag, 1e-12))).astype(np.float32)
+        if self.cfg.tilt_db_per_decade != 0.0:
+            f = np.maximum(self.freqs, 1.0).astype(np.float32)
+            tilt = float(self.cfg.tilt_db_per_decade) * np.log10(f / float(self.cfg.tilt_ref_hz)).astype(np.float32)
+            db = db + tilt
 
         # Sample on a log-spaced frequency axis
-        sampled = _interp_spectrum(self.freqs, mag, self.target_freqs).astype(np.float32)
+        db_s = _interp_spectrum(self.freqs, db, self.target_freqs).astype(np.float32)
+        if self.cfg.autorange:
+            lo_t = float(np.percentile(db_s, float(self.cfg.autorange_low_pct)))
+            hi_t = float(np.percentile(db_s, float(self.cfg.autorange_high_pct))) + float(self.cfg.autorange_headroom_db)
+            if self._db_lo is None or self._db_hi is None:
+                self._db_lo, self._db_hi = lo_t, hi_t
+            else:
+                a_lo = float(self.cfg.autorange_attack) if lo_t > float(self._db_lo) else float(self.cfg.autorange_release)
+                a_hi = float(self.cfg.autorange_attack) if hi_t > float(self._db_hi) else float(self.cfg.autorange_release)
+                self._db_lo = (1.0 - a_lo) * float(self._db_lo) + a_lo * lo_t
+                self._db_hi = (1.0 - a_hi) * float(self._db_hi) + a_hi * hi_t
+            lo = float(self._db_lo)
+            hi = float(self._db_hi)
+            min_span = float(self.cfg.autorange_min_span_db)
+            if hi - lo < min_span:
+                mid = 0.5 * (hi + lo)
+                lo = mid - 0.5 * min_span
+                hi = mid + 0.5 * min_span
+        else:
+            lo = float(self.cfg.db_floor)
+            hi = float(self.cfg.db_ceil)
+        denom = (hi - lo) if (hi - lo) > 1e-6 else 1.0
+        sampled = np.clip((db_s - lo) / denom, 0.0, 1.0).astype(np.float32)
 
         # Smooth
         s = float(self.cfg.smoothing)

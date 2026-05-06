@@ -18,8 +18,10 @@ from aiohttp import web
 class VizConfig:
     # Audio
     sample_rate: int = 48_000
-    block_size: int = 2048
-    hop_size: int = 512
+    # Larger block_size improves low-frequency resolution (less "bass always on"),
+    # at the cost of latency and CPU.
+    block_size: int = 4096
+    hop_size: int = 1024
     # Optional: substring of the *playback* device name to pick loopback, e.g. "Realtek"
     # (also reads env MUSIC_VIZ_OUTPUT_SUBSTR if empty)
     output_name_substr: str = ""
@@ -27,8 +29,22 @@ class VizConfig:
     # Spectrum
     f_min: float = 30.0
     f_max: float = 18_000.0
-    n_points: int = 384
+    n_points: int = 512
     smoothing: float = 0.84
+    # Stable dB mapping avoids per-frame min/max normalization biasing bass.
+    db_floor: float = -80.0  # lower clamp (silence / noise floor)
+    db_ceil: float = -30.0  # upper clamp (very loud)
+    # Auto-range (slow AGC) to prevent constant clipping/saturation.
+    autorange: bool = True
+    autorange_low_pct: float = 15.0
+    autorange_high_pct: float = 98.0
+    autorange_attack: float = 0.12  # 0..1, faster = adapts quicker to louder content
+    autorange_release: float = 0.02  # 0..1, slower = steadier baseline
+    autorange_headroom_db: float = 6.0  # keep peaks from pinning at 1.0
+    autorange_min_span_db: float = 45.0  # minimum dynamic range
+    # Frequency tilt (simple "EQ"): positive values boost highs vs lows (reduces bass dominance).
+    tilt_db_per_decade: float = 6.0
+    tilt_ref_hz: float = 200.0
 
     # Server
     host: str = "127.0.0.1"
@@ -98,6 +114,8 @@ class LoopbackStream:
         self.target_freqs = _log_space_freqs(cfg.f_min, cfg.f_max, cfg.n_points).astype(np.float32)
         self.prev = np.zeros(cfg.n_points, dtype=np.float32)
         self.freqs = np.fft.rfftfreq(cfg.block_size, 1.0 / cfg.sample_rate).astype(np.float32)
+        self._db_lo: float | None = None
+        self._db_hi: float | None = None
 
         self._ring = np.zeros(cfg.block_size * 4, dtype=np.float32)
         self._w = 0
@@ -207,13 +225,39 @@ class LoopbackStream:
         x = blk * self.window
         spec = np.fft.rfft(x)
         mag = np.abs(spec).astype(np.float32)
+        # Convert to dBFS-ish magnitude (relative), then apply gentle frequency tilt.
+        db = 20.0 * np.log10(np.maximum(mag, 1e-12)).astype(np.float32)
+        if self.cfg.tilt_db_per_decade != 0.0:
+            f = np.maximum(self.freqs, 1.0).astype(np.float32)
+            tilt = float(self.cfg.tilt_db_per_decade) * np.log10(f / float(self.cfg.tilt_ref_hz)).astype(np.float32)
+            db = db + tilt
 
-        mag = np.log10(1e-6 + mag)
-        mag -= mag.min()
-        denom = mag.max() if mag.max() > 1e-9 else 1.0
-        mag /= denom
+        db_s = _interp_spectrum(self.freqs, db, self.target_freqs).astype(np.float32)
+        # Map dB -> 0..1 using either fixed range or slow auto-range (recommended).
+        if self.cfg.autorange:
+            lo_t = float(np.percentile(db_s, float(self.cfg.autorange_low_pct)))
+            hi_t = float(np.percentile(db_s, float(self.cfg.autorange_high_pct))) + float(self.cfg.autorange_headroom_db)
 
-        sampled = _interp_spectrum(self.freqs, mag, self.target_freqs).astype(np.float32)
+            if self._db_lo is None or self._db_hi is None:
+                self._db_lo, self._db_hi = lo_t, hi_t
+            else:
+                a_lo = float(self.cfg.autorange_attack) if lo_t > float(self._db_lo) else float(self.cfg.autorange_release)
+                a_hi = float(self.cfg.autorange_attack) if hi_t > float(self._db_hi) else float(self.cfg.autorange_release)
+                self._db_lo = (1.0 - a_lo) * float(self._db_lo) + a_lo * lo_t
+                self._db_hi = (1.0 - a_hi) * float(self._db_hi) + a_hi * hi_t
+
+            lo = float(self._db_lo)
+            hi = float(self._db_hi)
+            min_span = float(self.cfg.autorange_min_span_db)
+            if hi - lo < min_span:
+                mid = 0.5 * (hi + lo)
+                lo = mid - 0.5 * min_span
+                hi = mid + 0.5 * min_span
+        else:
+            lo = float(self.cfg.db_floor)
+            hi = float(self.cfg.db_ceil)
+        denom = (hi - lo) if (hi - lo) > 1e-6 else 1.0
+        sampled = np.clip((db_s - lo) / denom, 0.0, 1.0).astype(np.float32)
 
         s = float(self.cfg.smoothing)
         out = s * self.prev + (1.0 - s) * sampled
