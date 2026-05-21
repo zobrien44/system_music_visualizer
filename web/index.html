@@ -19,16 +19,63 @@
         position: absolute;
         left: 10px;
         top: 10px;
-        padding: 10px 12px;
+        z-index: 20;
+        min-width: 200px;
+        max-width: min(420px, calc(100vw - 24px));
         background: rgba(10, 12, 20, 0.65);
         border: 1px solid rgba(120, 150, 255, 0.25);
         border-radius: 10px;
         backdrop-filter: blur(8px);
         line-height: 1.35;
         user-select: none;
+        overflow: hidden;
       }
-      #hud strong {
+      #hud.hud--collapsed {
+        min-width: 0;
+        max-width: none;
+      }
+      #hud-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+      }
+      #hud.hud--collapsed #hud-header {
+        padding: 6px 8px;
+      }
+      #hud-title {
         color: #ffffff;
+        font-weight: 600;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      #hud-toggle {
+        flex-shrink: 0;
+        margin: 0;
+        padding: 2px 8px;
+        border: 1px solid rgba(120, 150, 255, 0.35);
+        border-radius: 6px;
+        background: rgba(30, 40, 70, 0.5);
+        color: #c7d1ff;
+        font: inherit;
+        font-size: 11px;
+        line-height: 1.3;
+        cursor: pointer;
+      }
+      #hud-toggle:hover {
+        background: rgba(50, 70, 120, 0.65);
+        color: #fff;
+      }
+      #hud-toggle:focus-visible {
+        outline: 2px solid rgba(120, 150, 255, 0.8);
+        outline-offset: 2px;
+      }
+      #hud-body {
+        padding: 0 12px 10px;
+      }
+      #hud.hud--collapsed #hud-body {
+        display: none;
       }
       #hint {
         opacity: 0.85;
@@ -99,9 +146,16 @@
   </head>
   <body>
     <div id="hud">
-      <div><strong>System Audio Spectroscope</strong></div>
-      <div id="status">connecting…</div>
-      <div id="hint">Drag to orbit · Scroll to zoom · Fixed 60 Hz viz · Smooth scroll 24 rows/s</div>
+      <div id="hud-header">
+        <span id="hud-title">Spectroscope</span>
+        <button type="button" id="hud-toggle" aria-expanded="true" aria-controls="hud-body" title="Minimize panel">
+          −
+        </button>
+      </div>
+      <div id="hud-body">
+        <div id="status">connecting…</div>
+        <div id="hint">Drag to orbit · Scroll to zoom · Fixed 60 Hz viz · Smooth scroll 24 rows/s</div>
+      </div>
     </div>
 
     <div id="axis-legends" data-axis-legend="1" aria-hidden="true"></div>
@@ -111,8 +165,33 @@
       import { OrbitControls } from "/vendor/OrbitControls.js";
 
       const statusEl = document.getElementById("status");
+      const hudEl = document.getElementById("hud");
+      const hudToggleEl = document.getElementById("hud-toggle");
+
+      function initHudCollapse() {
+        const key = "music_viz_hud_collapsed";
+        const setCollapsed = (collapsed) => {
+          hudEl.classList.toggle("hud--collapsed", collapsed);
+          hudToggleEl.setAttribute("aria-expanded", collapsed ? "false" : "true");
+          hudToggleEl.textContent = collapsed ? "+" : "−";
+          hudToggleEl.title = collapsed ? "Show panel" : "Minimize panel";
+        };
+        try {
+          setCollapsed(localStorage.getItem(key) === "1");
+        } catch (_) {
+          setCollapsed(false);
+        }
+        hudToggleEl.addEventListener("click", () => {
+          const collapsed = !hudEl.classList.contains("hud--collapsed");
+          setCollapsed(collapsed);
+          try {
+            localStorage.setItem(key, collapsed ? "1" : "0");
+          } catch (_) {}
+        });
+      }
 
       function main() {
+        initHudCollapse();
         // #region agent log
         fetch("http://127.0.0.1:7764/ingest/e4740462-32b8-4549-b086-754682f74b57", {
           method: "POST",
