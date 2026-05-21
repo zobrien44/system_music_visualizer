@@ -78,6 +78,15 @@
       .viz-3d-label[data-align="left"] {
         transform: translate(calc(-100% - 8px), -50%);
       }
+      .viz-3d-label[data-align="right"] {
+        transform: translate(8px, -50%);
+      }
+      .viz-3d-label[data-align="below"] {
+        transform: translate(-50%, 6px);
+      }
+      .viz-3d-label[data-align="below-left"] {
+        transform: translate(calc(-100% - 8px), 6px);
+      }
     </style>
     <!-- Local Three.js (served from /vendor/ by music_viz_server.py); no CDN required -->
     <script type="importmap">
@@ -92,7 +101,7 @@
     <div id="hud">
       <div><strong>System Audio Spectroscope</strong></div>
       <div id="status">connecting…</div>
-      <div id="hint">Drag to orbit · Scroll to zoom · X = frequency · Y = time memory · Z = amplitude</div>
+      <div id="hint">Drag to orbit · Scroll to zoom · Fixed 60 Hz viz · Smooth scroll 24 rows/s</div>
     </div>
 
     <div id="axis-legends" data-axis-legend="1" aria-hidden="true"></div>
@@ -165,25 +174,29 @@
         const _legendFrustum = new THREE.Frustum();
         const _legendFrustumMat = new THREE.Matrix4();
 
-        // Motion smoothing (client-side):
-        // - `aLatest` is only updated from websocket frames.
-        // - `aDisplay` is lerped toward spatially blurred `aLatest` every render frame (fluid motion).
-        // Asymmetric temporal smoothing: quick rise (responsive), slower fall (fluid decay).
+        // Fixed-rate simulation (decoupled from monitor/WebSocket jitter).
+        const SIM_HZ = 60;
+        const SIM_DT = 1 / SIM_HZ;
+        const SCROLL_ROWS_PER_SEC = 24;
+        const MAX_SIM_STEPS_PER_FRAME = 8;
         const MOTION_ATTACK_HZ = 14;
-        const MOTION_RELEASE_HZ = 4.5;
-        const SPATIAL_BLUR = 0.2; // 0..0.5 per pass; neighbor averaging
-        const SPATIAL_PASSES = 2; // 1 or 2 (second pass extra-softens spikes)
-        let aLatest = null; // raw spectrum from server
-        let aBlurred = null; // scratch + pass-1 output
-        let aBlur2 = null; // pass-2 output (when SPATIAL_PASSES>=2)
-        let aDisplay = null; // smoothed values driving the mesh
-        let aHistory = null; // nx * ny rolling memory (row ny-1 = newest)
-        let hasNewFrame = false;
+        const MOTION_RELEASE_HZ = 9;
+        const SPATIAL_BLUR = 0.2;
+        const SPATIAL_PASSES = 2;
+        let aLatest = null;
+        let aBlurred = null;
+        let aBlur2 = null;
+        let aDisplay = null;
+        let aHistory = null;
+        let historyHead = 0;
+        let scrollPhase = 0;
+        let simAccumulator = 0;
         let _lastAnimT = performance.now();
+        let _normalsTick = 0;
 
         const PLANE_W = 168;
         const PLANE_H = 120;
-        const PLANE_NY = 96;
+        const PLANE_NY = 160;
         const FLOOR_Y = -8;
         const HEIGHT = 28;
         /** Wall plane for axis anchors (Z = 0). */
@@ -214,8 +227,8 @@
           }
         }
 
-        /** t in [0,1]: low freq -> red, high -> purple (matches music_viz_3d HSV sweep) */
-        function freqRgb(t) {
+        /** t in [0,1]: low amplitude -> red, high -> purple (color varies along Z) */
+        function ampRgb(t) {
           const tt = Math.max(0, Math.min(1, t));
           const h = tt * (280 / 360);
           return hsvToRgb(h, 0.86, 1.0);
@@ -262,8 +275,8 @@
         }
 
         /**
-         * Frequency ticks along mesh X at the floor; amplitude ticks along the low-X edge at world Y.
-         * Labels are reprojected every frame so they stay glued to the waveform under OrbitControls.
+         * Axis legends glued to the spectroscope edges (reprojected each frame):
+         * X = frequency (bottom), Y = time/history (left), Z = amplitude depth (bottom-left corner).
          */
         function buildAxisLegends(fMin, fMax) {
           const root = document.getElementById("axis-legends");
@@ -283,6 +296,14 @@
           root.innerHTML = "";
           legendAnchors = [];
 
+          const x0 = -PLANE_W * 0.5;
+          const x1 = PLANE_W * 0.5;
+          const y0 = FLOOR_Y;
+          const y1 = FLOOR_Y + PLANE_H;
+          const z0 = WALL_Z;
+          const z1 = WALL_Z + HEIGHT;
+          const zLbl = WALL_Z + 1.5;
+
           const pushLabel = (html, wx, wy, wz, className, dataAlign) => {
             const el = document.createElement("div");
             el.className = `viz-3d-label ${className}`.trim();
@@ -292,7 +313,15 @@
             legendAnchors.push({ el, world: new THREE.Vector3(wx, wy, wz) });
           };
 
-          pushLabel("Frequency (Hz) · low ← → high", 0, FLOOR_Y + 4, WALL_Z, "viz-3d-title", "above");
+          // —— X axis: frequency (along bottom of wall) ——
+          pushLabel(
+            `Frequency (Hz)<span class="viz-3d-sub">left = bass · right = treble</span>`,
+            0,
+            y0 - 5,
+            zLbl,
+            "viz-3d-title",
+            "above"
+          );
 
           const lf0 = Math.log(fMin);
           const lf1 = Math.log(fMax);
@@ -301,59 +330,62 @@
           for (const f of cand) {
             if (f < fMin * 0.99 || f > fMax * 1.01) continue;
             const t = (Math.log(Math.max(f, fMin * 1.0001)) - lf0) / (lf1 - lf0);
-            const x = -PLANE_W * 0.5 + t * PLANE_W;
-            pushLabel(formatHz(f), x, FLOOR_Y + 1.25, WALL_Z, "", "center");
+            const x = x0 + t * PLANE_W;
+            pushLabel(formatHz(f), x, y0 + 1.5, zLbl, "", "below");
             nFreq++;
           }
 
+          // —— Y axis: time / memory (along left edge of wall) ——
           pushLabel(
-            `Amplitude<span class="viz-3d-sub">normalized 0–1 (mesh Z)</span>`,
-            -PLANE_W * 0.5 - 4,
-            FLOOR_Y + PLANE_H * 0.55,
-            WALL_Z + HEIGHT * 0.5,
+            `Time (history)<span class="viz-3d-sub">up = newest · down = older</span>`,
+            x0 - 10,
+            y0 + PLANE_H * 0.5,
+            zLbl,
+            "viz-3d-title",
+            "left"
+          );
+          pushLabel("Newer", x0 - 2, y1 - 3, zLbl, "", "left");
+          pushLabel("Older", x0 - 2, y0 + 3, zLbl, "", "left");
+
+          // —— Z axis: amplitude depth (bottom-left corner, outward from wall) ——
+          const zGuideY = y0 + 10;
+          pushLabel(
+            `Loudness (Z depth)<span class="viz-3d-sub">color: red = quiet · purple = loud</span>`,
+            x0 - 10,
+            zGuideY,
+            (z0 + z1) * 0.5,
             "viz-3d-title",
             "left"
           );
 
           const amps = [0, 0.25, 0.5, 0.75, 1.0];
-          const xAmp = -PLANE_W * 0.5 - 1.25;
-          const yAmp = FLOOR_Y + PLANE_H * 0.55;
           for (const a of amps) {
-            pushLabel(a.toFixed(2), xAmp, yAmp, WALL_Z + HEIGHT * a, "", "left");
+            const tag =
+              a === 0 ? "0.00 · quiet" : a === 1 ? "1.00 · loud" : a.toFixed(2);
+            pushLabel(tag, x0 + 3, zGuideY, z0 + HEIGHT * a, "", "right");
           }
-
-          pushLabel(
-            `Time<span class="viz-3d-sub">past ↓ · now ↑ (memory scroll)</span>`,
-            -PLANE_W * 0.5 + 8,
-            FLOOR_Y + PLANE_H * 0.5,
-            WALL_Z,
-            "viz-3d-title",
-            "left"
-          );
-          pushLabel("now", -PLANE_W * 0.5 + 8, FLOOR_Y + PLANE_H - 2, WALL_Z, "", "left");
-          pushLabel("past", -PLANE_W * 0.5 + 8, FLOOR_Y + 2, WALL_Z, "", "left");
 
           const lineMat = new THREE.LineBasicMaterial({
             color: 0x6a8cff,
             transparent: true,
-            opacity: 0.42,
+            opacity: 0.5,
           });
           const geoFreq = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + 0.06, WALL_Z),
-            new THREE.Vector3(PLANE_W * 0.5, FLOOR_Y + 0.06, WALL_Z),
-          ]);
-          const geoAmp = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-PLANE_W * 0.5, yAmp, WALL_Z),
-            new THREE.Vector3(-PLANE_W * 0.5, yAmp, WALL_Z + HEIGHT),
+            new THREE.Vector3(x0, y0 + 0.5, zLbl),
+            new THREE.Vector3(x1, y0 + 0.5, zLbl),
           ]);
           const geoTime = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-PLANE_W * 0.5 + 6, FLOOR_Y + 2, WALL_Z),
-            new THREE.Vector3(-PLANE_W * 0.5 + 6, FLOOR_Y + PLANE_H - 2, WALL_Z),
+            new THREE.Vector3(x0 + 0.5, y0 + 2, zLbl),
+            new THREE.Vector3(x0 + 0.5, y1 - 2, zLbl),
+          ]);
+          const geoAmp = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(x0 + 1, zGuideY, z0),
+            new THREE.Vector3(x0 + 1, zGuideY, z1),
           ]);
           const lineFreq = new THREE.Line(geoFreq, lineMat);
-          const lineAmp = new THREE.Line(geoAmp, lineMat);
           const lineTime = new THREE.Line(geoTime, lineMat);
-          scene.add(lineFreq, lineAmp, lineTime);
+          const lineAmp = new THREE.Line(geoAmp, lineMat);
+          scene.add(lineFreq, lineTime, lineAmp);
           legendRefLines = { freq: lineFreq, amp: lineAmp, time: lineTime, mat: lineMat };
 
           return { freq: nFreq, amp: amps.length };
@@ -373,6 +405,10 @@
           aBlur2 = new Float32Array(nPoints);
           aDisplay = new Float32Array(nPoints);
           aHistory = new Float32Array(nPoints * PLANE_NY);
+          historyHead = 0;
+          scrollPhase = 0;
+          simAccumulator = 0;
+          _normalsTick = 0;
           const nx = n;
           const ny = PLANE_NY;
           const nVert = nx * ny;
@@ -388,8 +424,7 @@
               TIME_BRIGHT_FLOOR + (1 - TIME_BRIGHT_FLOOR) * Math.pow(timeT, DEPTH_FADE_EXP);
             for (let i = 0; i < nx; i++) {
               const vi = j * nx + i;
-              const t = i / denom;
-              const [r, g, b] = freqRgb(t);
+              const [r, g, b] = ampRgb(0);
               const gain = COLOR_GAIN * timeBright;
               colors[vi * 3 + 0] = Math.min(1, r * gain);
               colors[vi * 3 + 1] = Math.min(1, g * gain);
@@ -433,42 +468,84 @@
         function updateFrame(a) {
           if (!aLatest || a.length !== nPoints) return;
           for (let i = 0; i < nPoints; i++) aLatest[i] = Math.max(0, Math.min(1, a[i]));
-          hasNewFrame = true;
         }
 
-        /** Scroll history down Y; newest imprint at top (high Y). */
-        function pushHistorySlice(slice) {
-          if (!aHistory || !slice || slice.length !== nPoints) return;
+        function modRow(rowF) {
+          const ny = PLANE_NY;
+          return ((rowF % ny) + ny) % ny;
+        }
+
+        function sampleRing(rowF, i) {
           const nx = nPoints;
           const ny = PLANE_NY;
-          for (let j = 0; j < ny - 1; j++) {
-            const dst = j * nx;
-            const src = (j + 1) * nx;
-            aHistory.set(aHistory.subarray(src, src + nx), dst);
+          const w = modRow(rowF);
+          const j0 = Math.floor(w);
+          const f = w - j0;
+          const j1 = (j0 + 1) % ny;
+          const a0 = aHistory[j0 * nx + i];
+          const a1 = aHistory[j1 * nx + i];
+          return a0 + (a1 - a0) * f;
+        }
+
+        function writeHeadRow() {
+          if (!aHistory || !aDisplay) return;
+          const nx = nPoints;
+          const row = historyHead * nx;
+          for (let i = 0; i < nx; i++) aHistory[row + i] = aDisplay[i];
+        }
+
+        /** Fixed scroll speed along Y (rows per second), independent of WebSocket timing. */
+        function advanceScroll(dtSec) {
+          scrollPhase += dtSec * SCROLL_ROWS_PER_SEC;
+          if (scrollPhase >= 1) {
+            scrollPhase -= 1;
+            historyHead = (historyHead + 1) % PLANE_NY;
+            writeHeadRow();
           }
-          const newest = (ny - 1) * nx;
-          for (let i = 0; i < nx; i++) aHistory[newest + i] = slice[i];
+        }
+
+        /** One fixed simulation tick: smooth spectrum, scroll, update geometry. */
+        function simTick(dtSec) {
+          if (!aLatest || !aBlurred || !aDisplay || !aHistory || nPoints <= 0) return;
+
+          _applySpatialBlur(aLatest, aBlurred);
+          let tgt = aBlurred;
+          if (SPATIAL_PASSES >= 2) {
+            _applySpatialBlur(aBlurred, aBlur2);
+            tgt = aBlur2;
+          }
+          for (let i = 0; i < nPoints; i++) {
+            const err = tgt[i] - aDisplay[i];
+            const rate = err > 0 ? MOTION_ATTACK_HZ : MOTION_RELEASE_HZ;
+            const alpha = 1 - Math.exp(-rate * dtSec);
+            aDisplay[i] += err * alpha;
+          }
+
+          writeHeadRow();
+          advanceScroll(dtSec);
+          updateMeshFromHistory();
+          _normalsTick++;
         }
 
         function updateMeshFromHistory() {
           if (!positions || !geometry || !aHistory || nPoints <= 0) return;
           const nx = nPoints;
           const ny = PLANE_NY;
-          const denom = Math.max(1, nx - 1);
           const denomY = Math.max(1, ny - 1);
           for (let j = 0; j < ny; j++) {
             const timeT = j / denomY;
             const timeBright =
               TIME_BRIGHT_FLOOR + (1 - TIME_BRIGHT_FLOOR) * Math.pow(timeT, DEPTH_FADE_EXP);
+            const age = ny - 1 - j + scrollPhase;
+            const rowF = historyHead - age;
             const row = j * nx;
             for (let i = 0; i < nx; i++) {
               const vi = row + i;
-              const amp = aHistory[vi];
-              positions[vi * 3 + 2] = WALL_Z + HEIGHT * amp;
-              const t = i / denom;
-              const [r, g, b] = freqRgb(t);
-              const gain = COLOR_GAIN * timeBright * (0.72 + 0.38 * amp);
+              const amp = sampleRing(rowF, i);
               const o = vi * 3;
+              positions[o + 2] = WALL_Z + HEIGHT * amp;
+              const [r, g, b] = ampRgb(amp);
+              const gain = COLOR_GAIN * timeBright;
               colors[o + 0] = Math.min(1, r * gain);
               colors[o + 1] = Math.min(1, g * gain);
               colors[o + 2] = Math.min(1, b * gain);
@@ -578,36 +655,29 @@
           }
         };
 
-        // Render loop
+        // Render loop: rAF draws the screen; simulation advances at a fixed SIM_Hz.
         function animate() {
           requestAnimationFrame(animate);
           const nowT = performance.now();
-          const dtSec = Math.min(0.05, Math.max(0, (nowT - _lastAnimT) / 1000));
+          const frameDt = Math.min(0.1, Math.max(0, (nowT - _lastAnimT) / 1000));
           _lastAnimT = nowT;
           controls.update();
           updateLegendScreenPositions();
-          // Smooth latest spectrum, push into Y-scroll history, extrude amplitude on Z.
-          if (positions && geometry && aLatest && aBlurred && aDisplay && aHistory && nPoints > 0) {
-            _applySpatialBlur(aLatest, aBlurred);
-            let tgt = aBlurred;
-            if (SPATIAL_PASSES >= 2) {
-              _applySpatialBlur(aBlurred, aBlur2);
-              tgt = aBlur2;
-            }
-            for (let i = 0; i < nPoints; i++) {
-              const err = tgt[i] - aDisplay[i];
-              const rate = err > 0 ? MOTION_ATTACK_HZ : MOTION_RELEASE_HZ;
-              const alpha = 1 - Math.exp(-rate * dtSec);
-              aDisplay[i] += err * alpha;
-            }
 
-            if (hasNewFrame) {
-              pushHistorySlice(aDisplay);
-              hasNewFrame = false;
+          if (positions && geometry && aHistory && nPoints > 0) {
+            simAccumulator += frameDt;
+            let steps = 0;
+            while (simAccumulator >= SIM_DT && steps < MAX_SIM_STEPS_PER_FRAME) {
+              simTick(SIM_DT);
+              simAccumulator -= SIM_DT;
+              steps++;
             }
-            updateMeshFromHistory();
-            if ((nowT | 0) % 3 === 0) geometry.computeVertexNormals();
+            if (_normalsTick > 0 && geometry) {
+              geometry.computeVertexNormals();
+              _normalsTick = 0;
+            }
           }
+
           renderer.render(scene, camera);
         }
         animate();
