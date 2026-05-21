@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>System Audio Spectrum Plane</title>
+    <title>System Audio Spectroscope</title>
     <style>
       html,
       body {
@@ -90,9 +90,9 @@
   </head>
   <body>
     <div id="hud">
-      <div><strong>System Audio Spectrum Plane</strong></div>
+      <div><strong>System Audio Spectroscope</strong></div>
       <div id="status">connecting…</div>
-      <div id="hint">Drag to orbit · Scroll to zoom</div>
+      <div id="hint">Drag to orbit · Scroll to zoom · X = frequency · Y = time memory · Z = amplitude</div>
     </div>
 
     <div id="axis-legends" data-axis-legend="1" aria-hidden="true"></div>
@@ -121,33 +121,38 @@
         statusEl.textContent = "loaded (initializing 3D + websocket)…";
         // Scene
         const scene = new THREE.Scene();
-        scene.fog = new THREE.Fog(0x05060a, 90, 220);
+        scene.fog = new THREE.Fog(0x05060a, 130, 280);
 
         const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.1, 600);
-        camera.position.set(0, 42, 135);
+        camera.position.set(0, 48, 150);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
         renderer.setSize(window.innerWidth, window.innerHeight);
+        if ("toneMappingExposure" in renderer) renderer.toneMappingExposure = 1.28;
         document.body.appendChild(renderer.domElement);
 
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.06;
-        controls.target.set(0, 6, 0);
+        controls.target.set(0, 42, 12);
 
-        // Lights
-        scene.add(new THREE.AmbientLight(0xffffff, 0.35));
-        const dir = new THREE.DirectionalLight(0xaac6ff, 0.9);
-        dir.position.set(40, 80, 20);
-        scene.add(dir);
+        // Lights — boosted so the spectroscope wall reads clearly
+        scene.add(new THREE.AmbientLight(0xe8eeff, 0.58));
+        scene.add(new THREE.HemisphereLight(0xc8d8ff, 0x1a2030, 0.48));
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
+        keyLight.position.set(30, 70, 110);
+        scene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0xa0b8ff, 0.55);
+        fillLight.position.set(-80, 40, 60);
+        scene.add(fillLight);
 
         // Grid
         const grid = new THREE.GridHelper(220, 44, 0x2840aa, 0x16214f);
         grid.position.y = -8;
         scene.add(grid);
 
-        // Indexed plane mesh: X = frequency, Z = depth (thin), Y = amplitude height
+        // XY spectroscope wall: X = frequency, Y = time/history, Z = amplitude (depth from wall)
         let nPoints = 0;
         let positions = null;
         let colors = null;
@@ -172,16 +177,20 @@
         let aBlurred = null; // scratch + pass-1 output
         let aBlur2 = null; // pass-2 output (when SPATIAL_PASSES>=2)
         let aDisplay = null; // smoothed values driving the mesh
+        let aHistory = null; // nx * ny rolling memory (row ny-1 = newest)
+        let hasNewFrame = false;
         let _lastAnimT = performance.now();
 
-        // X = frequency "length", Z = sheet "width" (depth). Tuned: −30% length, +50% width vs prior 240×10.
         const PLANE_W = 168;
-        const PLANE_D = 15;
-        const PLANE_NZ = 3;
+        const PLANE_H = 120;
+        const PLANE_NY = 96;
         const FLOOR_Y = -8;
         const HEIGHT = 28;
-        /** Depth slice used for axis anchors (center of ribbon in Z). */
-        const AXIS_Z = 0;
+        /** Wall plane for axis anchors (Z = 0). */
+        const WALL_Z = 0;
+        const DEPTH_FADE_EXP = 1.35;
+        const COLOR_GAIN = 1.38;
+        const TIME_BRIGHT_FLOOR = 0.48;
 
         function hsvToRgb(h, s, v) {
           const i = Math.floor(h * 6) % 6;
@@ -209,7 +218,7 @@
         function freqRgb(t) {
           const tt = Math.max(0, Math.min(1, t));
           const h = tt * (280 / 360);
-          return hsvToRgb(h, 0.92, 1.0);
+          return hsvToRgb(h, 0.86, 1.0);
         }
 
         function formatHz(f) {
@@ -263,8 +272,10 @@
           if (legendRefLines) {
             scene.remove(legendRefLines.freq);
             scene.remove(legendRefLines.amp);
+            if (legendRefLines.time) scene.remove(legendRefLines.time);
             legendRefLines.freq.geometry.dispose();
             legendRefLines.amp.geometry.dispose();
+            if (legendRefLines.time) legendRefLines.time.geometry.dispose();
             legendRefLines.mat.dispose();
             legendRefLines = null;
           }
@@ -281,7 +292,7 @@
             legendAnchors.push({ el, world: new THREE.Vector3(wx, wy, wz) });
           };
 
-          pushLabel("Frequency (Hz) · low ← → high", 0, FLOOR_Y + 6, AXIS_Z, "viz-3d-title", "above");
+          pushLabel("Frequency (Hz) · low ← → high", 0, FLOOR_Y + 4, WALL_Z, "viz-3d-title", "above");
 
           const lf0 = Math.log(fMin);
           const lf1 = Math.log(fMax);
@@ -291,24 +302,36 @@
             if (f < fMin * 0.99 || f > fMax * 1.01) continue;
             const t = (Math.log(Math.max(f, fMin * 1.0001)) - lf0) / (lf1 - lf0);
             const x = -PLANE_W * 0.5 + t * PLANE_W;
-            pushLabel(formatHz(f), x, FLOOR_Y + 1.25, AXIS_Z, "", "center");
+            pushLabel(formatHz(f), x, FLOOR_Y + 1.25, WALL_Z, "", "center");
             nFreq++;
           }
 
           pushLabel(
-            `Amplitude<span class="viz-3d-sub">normalized 0–1 (mesh Y)</span>`,
+            `Amplitude<span class="viz-3d-sub">normalized 0–1 (mesh Z)</span>`,
             -PLANE_W * 0.5 - 4,
-            FLOOR_Y + HEIGHT * 0.58,
-            AXIS_Z,
+            FLOOR_Y + PLANE_H * 0.55,
+            WALL_Z + HEIGHT * 0.5,
             "viz-3d-title",
             "left"
           );
 
           const amps = [0, 0.25, 0.5, 0.75, 1.0];
           const xAmp = -PLANE_W * 0.5 - 1.25;
+          const yAmp = FLOOR_Y + PLANE_H * 0.55;
           for (const a of amps) {
-            pushLabel(a.toFixed(2), xAmp, FLOOR_Y + HEIGHT * a, AXIS_Z, "", "left");
+            pushLabel(a.toFixed(2), xAmp, yAmp, WALL_Z + HEIGHT * a, "", "left");
           }
+
+          pushLabel(
+            `Time<span class="viz-3d-sub">past ↓ · now ↑ (memory scroll)</span>`,
+            -PLANE_W * 0.5 + 8,
+            FLOOR_Y + PLANE_H * 0.5,
+            WALL_Z,
+            "viz-3d-title",
+            "left"
+          );
+          pushLabel("now", -PLANE_W * 0.5 + 8, FLOOR_Y + PLANE_H - 2, WALL_Z, "", "left");
+          pushLabel("past", -PLANE_W * 0.5 + 8, FLOOR_Y + 2, WALL_Z, "", "left");
 
           const lineMat = new THREE.LineBasicMaterial({
             color: 0x6a8cff,
@@ -316,17 +339,22 @@
             opacity: 0.42,
           });
           const geoFreq = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + 0.06, AXIS_Z),
-            new THREE.Vector3(PLANE_W * 0.5, FLOOR_Y + 0.06, AXIS_Z),
+            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + 0.06, WALL_Z),
+            new THREE.Vector3(PLANE_W * 0.5, FLOOR_Y + 0.06, WALL_Z),
           ]);
           const geoAmp = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y, AXIS_Z),
-            new THREE.Vector3(-PLANE_W * 0.5, FLOOR_Y + HEIGHT, AXIS_Z),
+            new THREE.Vector3(-PLANE_W * 0.5, yAmp, WALL_Z),
+            new THREE.Vector3(-PLANE_W * 0.5, yAmp, WALL_Z + HEIGHT),
+          ]);
+          const geoTime = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(-PLANE_W * 0.5 + 6, FLOOR_Y + 2, WALL_Z),
+            new THREE.Vector3(-PLANE_W * 0.5 + 6, FLOOR_Y + PLANE_H - 2, WALL_Z),
           ]);
           const lineFreq = new THREE.Line(geoFreq, lineMat);
           const lineAmp = new THREE.Line(geoAmp, lineMat);
-          scene.add(lineFreq, lineAmp);
-          legendRefLines = { freq: lineFreq, amp: lineAmp, mat: lineMat };
+          const lineTime = new THREE.Line(geoTime, lineMat);
+          scene.add(lineFreq, lineAmp, lineTime);
+          legendRefLines = { freq: lineFreq, amp: lineAmp, time: lineTime, mat: lineMat };
 
           return { freq: nFreq, amp: amps.length };
         }
@@ -344,31 +372,36 @@
           aBlurred = new Float32Array(nPoints);
           aBlur2 = new Float32Array(nPoints);
           aDisplay = new Float32Array(nPoints);
+          aHistory = new Float32Array(nPoints * PLANE_NY);
           const nx = n;
-          const nz = PLANE_NZ;
-          const nVert = nx * nz;
+          const ny = PLANE_NY;
+          const nVert = nx * ny;
           positions = new Float32Array(nVert * 3);
           colors = new Float32Array(nVert * 3);
           const ix = [];
           const denom = Math.max(1, nx - 1);
-          const denomZ = Math.max(1, nz - 1);
+          const denomY = Math.max(1, ny - 1);
 
-          for (let j = 0; j < nz; j++) {
+          for (let j = 0; j < ny; j++) {
+            const timeT = j / denomY;
+            const timeBright =
+              TIME_BRIGHT_FLOOR + (1 - TIME_BRIGHT_FLOOR) * Math.pow(timeT, DEPTH_FADE_EXP);
             for (let i = 0; i < nx; i++) {
               const vi = j * nx + i;
               const t = i / denom;
               const [r, g, b] = freqRgb(t);
-              colors[vi * 3 + 0] = r;
-              colors[vi * 3 + 1] = g;
-              colors[vi * 3 + 2] = b;
+              const gain = COLOR_GAIN * timeBright;
+              colors[vi * 3 + 0] = Math.min(1, r * gain);
+              colors[vi * 3 + 1] = Math.min(1, g * gain);
+              colors[vi * 3 + 2] = Math.min(1, b * gain);
               const x = (i / denom) * PLANE_W - PLANE_W * 0.5;
-              const z = (j / denomZ) * PLANE_D - PLANE_D * 0.5;
+              const y = FLOOR_Y + timeT * PLANE_H;
               positions[vi * 3 + 0] = x;
-              positions[vi * 3 + 1] = FLOOR_Y;
-              positions[vi * 3 + 2] = z;
+              positions[vi * 3 + 1] = y;
+              positions[vi * 3 + 2] = WALL_Z;
             }
           }
-          for (let j = 0; j < nz - 1; j++) {
+          for (let j = 0; j < ny - 1; j++) {
             for (let i = 0; i < nx - 1; i++) {
               const a0 = j * nx + i;
               const b0 = j * nx + i + 1;
@@ -386,9 +419,12 @@
 
           const material = new THREE.MeshStandardMaterial({
             vertexColors: true,
-            metalness: 0.06,
-            roughness: 0.62,
+            metalness: 0.03,
+            roughness: 0.38,
+            emissive: 0x182040,
+            emissiveIntensity: 0.55,
             side: THREE.DoubleSide,
+            fog: false,
           });
           mesh = new THREE.Mesh(geometry, material);
           scene.add(mesh);
@@ -397,6 +433,49 @@
         function updateFrame(a) {
           if (!aLatest || a.length !== nPoints) return;
           for (let i = 0; i < nPoints; i++) aLatest[i] = Math.max(0, Math.min(1, a[i]));
+          hasNewFrame = true;
+        }
+
+        /** Scroll history down Y; newest imprint at top (high Y). */
+        function pushHistorySlice(slice) {
+          if (!aHistory || !slice || slice.length !== nPoints) return;
+          const nx = nPoints;
+          const ny = PLANE_NY;
+          for (let j = 0; j < ny - 1; j++) {
+            const dst = j * nx;
+            const src = (j + 1) * nx;
+            aHistory.set(aHistory.subarray(src, src + nx), dst);
+          }
+          const newest = (ny - 1) * nx;
+          for (let i = 0; i < nx; i++) aHistory[newest + i] = slice[i];
+        }
+
+        function updateMeshFromHistory() {
+          if (!positions || !geometry || !aHistory || nPoints <= 0) return;
+          const nx = nPoints;
+          const ny = PLANE_NY;
+          const denom = Math.max(1, nx - 1);
+          const denomY = Math.max(1, ny - 1);
+          for (let j = 0; j < ny; j++) {
+            const timeT = j / denomY;
+            const timeBright =
+              TIME_BRIGHT_FLOOR + (1 - TIME_BRIGHT_FLOOR) * Math.pow(timeT, DEPTH_FADE_EXP);
+            const row = j * nx;
+            for (let i = 0; i < nx; i++) {
+              const vi = row + i;
+              const amp = aHistory[vi];
+              positions[vi * 3 + 2] = WALL_Z + HEIGHT * amp;
+              const t = i / denom;
+              const [r, g, b] = freqRgb(t);
+              const gain = COLOR_GAIN * timeBright * (0.72 + 0.38 * amp);
+              const o = vi * 3;
+              colors[o + 0] = Math.min(1, r * gain);
+              colors[o + 1] = Math.min(1, g * gain);
+              colors[o + 2] = Math.min(1, b * gain);
+            }
+          }
+          geometry.attributes.position.needsUpdate = true;
+          geometry.attributes.color.needsUpdate = true;
         }
 
         function _applySpatialBlur(src, dst) {
@@ -418,7 +497,7 @@
         // WebSocket (must use http:// from music_viz_server — not file://)
         if (!location.host) {
           statusEl.textContent =
-            "Open this page from the app link (http://127.0.0.1:8765/), not as a saved file.";
+            "Open this page from the app link (http://127.0.0.1:8766/), not as a saved file.";
           return;
         }
         const wsProto = location.protocol === "https:" ? "wss" : "ws";
@@ -507,8 +586,8 @@
           _lastAnimT = nowT;
           controls.update();
           updateLegendScreenPositions();
-          // Smoothly move geometry toward the latest spectrum.
-          if (positions && geometry && aLatest && aBlurred && aDisplay && nPoints > 0) {
+          // Smooth latest spectrum, push into Y-scroll history, extrude amplitude on Z.
+          if (positions && geometry && aLatest && aBlurred && aDisplay && aHistory && nPoints > 0) {
             _applySpatialBlur(aLatest, aBlurred);
             let tgt = aBlurred;
             if (SPATIAL_PASSES >= 2) {
@@ -522,16 +601,11 @@
               aDisplay[i] += err * alpha;
             }
 
-            const nx = nPoints;
-            const nz = PLANE_NZ;
-            for (let j = 0; j < nz; j++) {
-              for (let i = 0; i < nx; i++) {
-                const vi = j * nx + i;
-                positions[vi * 3 + 1] = FLOOR_Y + HEIGHT * aDisplay[i];
-              }
+            if (hasNewFrame) {
+              pushHistorySlice(aDisplay);
+              hasNewFrame = false;
             }
-            geometry.attributes.position.needsUpdate = true;
-            // Normals are visually nice but expensive; keep them, but only recompute occasionally.
+            updateMeshFromHistory();
             if ((nowT | 0) % 3 === 0) geometry.computeVertexNormals();
           }
           renderer.render(scene, camera);
